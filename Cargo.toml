@@ -11,6 +11,8 @@ poise = "0.6.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serenity = "0.12.5"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "tracing"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.23"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.23", features = ["registry", "env-filter"] }
