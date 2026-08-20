@@ -22,12 +22,6 @@ pub(crate) struct GuildData {
     pub(crate) warning_threshold_days: i64,
 }
 
-#[derive(sqlx::FromRow)]
-pub(crate) struct User {
-    pub(crate) id: i64,
-    pub(crate) is_bot: bool,
-}
-
 #[derive(Debug, sqlx::FromRow, Default)]
 pub(crate) struct LastUserActivity {
     pub(crate) user_id: UserId,
@@ -44,10 +38,6 @@ impl Db {
             .await?;
         sqlx::migrate!().run(&pool).await?;
         Ok(Self { pool })
-    }
-
-    pub(crate) async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
-        self.pool.begin().await
     }
 
     pub(crate) async fn add_guild(&self, guild_id: GuildId) -> Result<(), sqlx::Error> {

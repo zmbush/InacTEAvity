@@ -1,6 +1,6 @@
 use eyre::{Context as _, OptionExt as _};
 use futures::StreamExt as _;
-use poise::serenity_prelude::{self as serenity, Timestamp};
+use poise::serenity_prelude::{self as serenity};
 
 use crate::db;
 
