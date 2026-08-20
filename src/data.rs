@@ -29,7 +29,7 @@ impl Data {
         // Prefill with current members
         for member in guild.members(ctx, None, None).await? {
             self.db
-                .add_user(member.user.id, member.user.bot)
+                .add_user(member.user.id, member.user.bot, Some(&member.user.name))
                 .await
                 .context("while adding user")?;
         }
@@ -59,7 +59,11 @@ impl Data {
                     }
                     tracing::info!("Message: {} ({})", message.id, message.timestamp);
                     self.db
-                        .add_user(message.author.id, message.author.bot)
+                        .add_user(
+                            message.author.id,
+                            message.author.bot,
+                            Some(&message.author.name),
+                        )
                         .await
                         .context("while adding user")?;
                     self.db

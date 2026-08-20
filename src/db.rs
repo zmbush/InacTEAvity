@@ -86,11 +86,17 @@ impl Db {
         Ok(())
     }
 
-    pub(crate) async fn add_user(&self, user_id: UserId, is_bot: bool) -> Result<(), sqlx::Error> {
+    pub(crate) async fn add_user(
+        &self,
+        user_id: UserId,
+        is_bot: bool,
+        username: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "INSERT INTO users (id, is_bot) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO users (id, is_bot, username) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET username = COALESCE(excluded.username, username)",
             i64::from(user_id),
-            is_bot
+            is_bot,
+            username,
         )
         .execute(&self.pool)
         .await?;

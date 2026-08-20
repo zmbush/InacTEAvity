@@ -163,7 +163,11 @@ async fn event_handler(
                 .add_channel(new_message.channel_id, None, guild_id)
                 .await?;
             data.db
-                .add_user(new_message.author.id, new_message.author.bot)
+                .add_user(
+                    new_message.author.id,
+                    new_message.author.bot,
+                    Some(&new_message.author.name),
+                )
                 .await?;
             data.db
                 .add_message(
@@ -192,7 +196,7 @@ async fn event_handler(
             data.db
                 .add_channel(add_reaction.channel_id, None, guild_id)
                 .await?;
-            data.db.add_user(user_id, false).await?;
+            data.db.add_user(user_id, false, None).await?;
             data.db
                 .add_message(
                     add_reaction.message_id,
