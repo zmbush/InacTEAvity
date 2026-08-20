@@ -18,6 +18,8 @@ pub(crate) struct GuildData {
     pub(crate) inactivity_threshold_days: i64,
     pub(crate) search_window_buffer_days: i64,
     pub(crate) report_channel: Option<i64>,
+    pub(crate) generate_report_at_hour: i64,
+    pub(crate) warning_threshold_days: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -80,6 +82,20 @@ impl Db {
         .await
     }
 
+    pub(crate) async fn update_guild(&self, data: GuildData) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE guilds SET inactivity_threshold_days = ?, search_window_buffer_days = ?, report_channel = ? WHERE id = ?",
+            data.inactivity_threshold_days,
+            data.search_window_buffer_days,
+            data.report_channel,
+            data.id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub(crate) async fn add_user(&self, user_id: UserId, is_bot: bool) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "INSERT INTO users (id, is_bot) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
@@ -99,11 +115,10 @@ impl Db {
         guild_id: GuildId,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "INSERT INTO channels (id, name, guild_id, name_old) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = COALESCE(excluded.name, name)",
+            "INSERT INTO channels (id, name, guild_id) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = COALESCE(excluded.name, name)",
             i64::from(channel_id),
             channel_name,
             i64::from(guild_id),
-            channel_name.unwrap_or("Unknown")
         )
         .execute(&self.pool)
         .await?;
@@ -126,7 +141,7 @@ impl Db {
         &self,
         message_id: MessageId,
         channel_id: ChannelId,
-        user_id: UserId,
+        user_id: Option<UserId>,
         timestamp: Timestamp,
         edited_timestamp: Option<Timestamp>,
     ) -> Result<(), sqlx::Error> {
@@ -134,7 +149,7 @@ impl Db {
             "INSERT INTO messages (id, channel_id, user_id, created_at, edited_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET edited_at = excluded.edited_at",
             i64::from(message_id),
             i64::from(channel_id),
-            i64::from(user_id),
+            user_id.map(|id| i64::from(id)),
             timestamp.unix_timestamp(),
             edited_timestamp.map(|t| t.unix_timestamp())
         )

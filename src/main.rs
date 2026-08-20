@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt::Write as _};
 
+use eyre::OptionExt as _;
 use poise::serenity_prelude::{self as serenity, Timestamp};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -11,8 +12,8 @@ type Error = eyre::Error;
 //  Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, data::Data, Error>;
 
-/// Displays your or another user's account creation date
-#[poise::command(slash_command, prefix_command)]
+/// Displays the information about users that will be timed out soon.
+#[poise::command(slash_command)]
 async fn timing_out(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
 
@@ -82,6 +83,47 @@ async fn timing_out(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Displays the information about users that will be timed out soon.
+#[poise::command(slash_command, ephemeral)]
+async fn config(
+    ctx: Context<'_>,
+    #[description = "The window of inactivity before timing out, in days. (default: 30)"]
+    inactivity_window_days: Option<i64>,
+    #[description = "Channel to notify about timeouts, a report will be generated once a day"]
+    notification_channel: Option<serenity::Channel>,
+    #[description = "The hour of the day to generate the report at (0-23) (UTC) (default: 12)"]
+    generate_report_at_hour: Option<i64>,
+    #[description = "The number of days before timeout a user is included in the report (default: 7)"]
+    warning_threshold_days: Option<i64>,
+) -> eyre::Result<()> {
+    let Some(guild_id) = ctx.guild_id() else {
+        ctx.say("This command can only be used in a guild".to_string())
+            .await?;
+        return Ok(());
+    };
+    let mut guild_data = ctx
+        .data()
+        .db
+        .get_guild(guild_id)
+        .await?
+        .ok_or_eyre("Guild not in DB")?;
+    if let Some(inactivity_window_days) = inactivity_window_days {
+        guild_data.inactivity_threshold_days = inactivity_window_days;
+    }
+    if let Some(channel) = notification_channel {
+        guild_data.report_channel = Some(i64::from(channel.id()));
+    }
+    if let Some(generate_report_at_hour) = generate_report_at_hour {
+        guild_data.generate_report_at_hour = generate_report_at_hour;
+    }
+    if let Some(warning_threshold_days) = warning_threshold_days {
+        guild_data.warning_threshold_days = warning_threshold_days;
+    }
+    ctx.data().db.update_guild(guild_data).await?;
+    ctx.say("Done.").await?;
+    Ok(())
+}
+
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -127,7 +169,7 @@ async fn event_handler(
                 .add_message(
                     new_message.id,
                     new_message.channel_id,
-                    new_message.author.id,
+                    Some(new_message.author.id),
                     new_message.timestamp,
                     new_message.edited_timestamp,
                 )
@@ -140,10 +182,6 @@ async fn event_handler(
             };
             let Some(user_id) = add_reaction.user_id else {
                 tracing::warn!("Reaction has no user_id: {:?}", add_reaction);
-                return Ok(());
-            };
-            let Some(message_author_id) = add_reaction.message_author_id else {
-                tracing::warn!("Reaction has no message_author_id: {:?}", add_reaction);
                 return Ok(());
             };
             tracing::info!(
@@ -159,7 +197,7 @@ async fn event_handler(
                 .add_message(
                     add_reaction.message_id,
                     add_reaction.channel_id,
-                    message_author_id,
+                    add_reaction.message_author_id,
                     Timestamp::now(),
                     None,
                 )
@@ -192,7 +230,7 @@ async fn main() -> eyre::Result<()> {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![timing_out()],
+            commands: vec![timing_out(), config()],
             event_handler: |ctx, event, _framework, data| {
                 Box::pin(async move { event_handler(ctx, event, data).await })
             },

@@ -66,7 +66,7 @@ impl Data {
                         .add_message(
                             message.id,
                             message.channel_id,
-                            message.author.id,
+                            Some(message.author.id),
                             message.timestamp,
                             message.edited_timestamp,
                         )
