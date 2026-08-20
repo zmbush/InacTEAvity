@@ -1,241 +1,77 @@
-use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _};
 
-use ::serenity::{futures::StreamExt, model::channel::MessagesIter};
-use eyre::{Context as _, OptionExt};
 use poise::serenity_prelude::{self as serenity, Timestamp};
-use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+mod data;
 mod db;
-
-const DATA_FILE: &str = "data.json";
-
-#[derive(Debug)]
-struct Data {
-    guild_data: Arc<Mutex<BTreeMap<serenity::GuildId, GuildData>>>,
-    db: db::Db,
-}
-
-impl Data {
-    async fn persist(&self) -> Result<(), Error> {
-        GuildData::persist(self.guild_data.lock().await)
-    }
-
-    async fn index<Ctx>(&self, ctx: Ctx, guild: serenity::GuildId) -> Result<(), Error>
-    where
-        Ctx: AsRef<serenity::Http> + serenity::CacheHttp + Copy,
-    {
-        let guild = guild.to_partial_guild(ctx).await?;
-        let guild_config = self
-            .db
-            .get_guild(guild.id)
-            .await?
-            .ok_or_eyre("Guild not in DB")?;
-        let lookback = chrono::Utc::now()
-            - chrono::Duration::days(guild_config.inactivity_threshold_days)
-            - chrono::Duration::days(guild_config.search_window_buffer_days);
-        tracing::info!("Indexing guild {} ({})", guild.name, guild.id);
-        // Prefill with current members
-        for member in guild.members(ctx, None, None).await? {
-            self.db
-                .add_user(member.user.id, member.user.bot)
-                .await
-                .context("while adding user")?;
-        }
-        for (id, channel) in guild.channels(ctx).await? {
-            if channel.is_text_based() {
-                self.db
-                    .add_channel(channel.id, Some(&channel.name), channel.guild_id)
-                    .await
-                    .context("while adding channel")?;
-
-                tracing::info!(" - Indexing channel {} ({})", channel.name, id);
-                let mut messages = MessagesIter::<serenity::Http>::stream(ctx, id).boxed();
-
-                while let Some(message) = messages.next().await {
-                    let Ok(message) = message else {
-                        tracing::warn!("Error fetching message: {:?}", message);
-                        break;
-                    };
-                    if *message.timestamp < lookback {
-                        // Stop looking back, we've been here before, or it is beyond our vision.
-                        break;
-                    }
-                    if self.db.seen_message(message.id).await? {
-                        // We've seen this message before.
-                        continue;
-                    }
-                    tracing::info!("Message: {} ({})", message.id, message.timestamp);
-                    self.db
-                        .add_user(message.author.id, message.author.bot)
-                        .await
-                        .context("while adding user")?;
-                    self.db
-                        .add_message(
-                            message.id,
-                            message.channel_id,
-                            message.author.id,
-                            message.timestamp,
-                            message.edited_timestamp,
-                        )
-                        .await
-                        .context("while adding message")?;
-                    for reaction in &message.reactions {
-                        for reactor in message
-                            .reaction_users(ctx, reaction.reaction_type.clone(), None, None)
-                            .await?
-                        {
-                            self.db
-                                .add_reaction(message.id, reactor.id, message.timestamp)
-                                .await
-                                .context("while adding reaction")?;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Default, Debug, Deserialize, Serialize)]
-struct GuildData {
-    last_event: BTreeMap<serenity::ChannelId, Timestamp>,
-    users_last_seen: BTreeMap<serenity::UserId, Timestamp>,
-}
-
-impl GuildData {
-    fn track(
-        &mut self,
-        user_id: serenity::UserId,
-        channel_id: Option<serenity::ChannelId>,
-        timestamp: Timestamp,
-    ) {
-        let previous = self
-            .users_last_seen
-            .entry(user_id)
-            .or_insert_with(|| Timestamp::from_unix_timestamp(0).unwrap());
-        *previous = std::cmp::max(*previous, timestamp);
-        if let Some(channel_id) = channel_id {
-            self.last_event
-                .entry(channel_id)
-                .and_modify(|e| *e = std::cmp::max(*e, timestamp))
-                .or_insert(timestamp);
-        }
-    }
-
-    fn persist(
-        guard: tokio::sync::MutexGuard<'_, BTreeMap<serenity::GuildId, GuildData>>,
-    ) -> Result<(), Error> {
-        let file = std::fs::File::create(DATA_FILE)?;
-        serde_json::to_writer_pretty(file, &*guard)?;
-        Ok(())
-    }
-
-    async fn index<Ctx>(&mut self, ctx: Ctx, guild: serenity::GuildId) -> Result<(), Error>
-    where
-        Ctx: AsRef<serenity::Http> + serenity::CacheHttp + Copy,
-    {
-        let guild = guild.to_partial_guild(ctx).await?;
-        tracing::info!("Indexing guild {} ({})", guild.name, guild.id);
-        // Prefill with current members
-        for member in guild.members(ctx, None, None).await? {
-            self.track(
-                member.user.id,
-                None,
-                member
-                    .joined_at
-                    .unwrap_or_else(|| Timestamp::from_unix_timestamp(0).unwrap()),
-            );
-        }
-        for (id, channel) in guild.channels(ctx).await? {
-            if channel.is_text_based() {
-                let last_processed_in_channel = self.last_event.get(&id).cloned();
-
-                tracing::info!(" - Indexing channel {} ({})", channel.name, id);
-                let mut messages = MessagesIter::<serenity::Http>::stream(ctx, id).boxed();
-
-                while let Some(message) = messages.next().await {
-                    let Ok(message) = message else {
-                        tracing::warn!("Error fetching message: {:?}", message);
-                        break;
-                    };
-                    tracing::info!("Message: {} ({})", message.id, message.timestamp);
-                    if *message.timestamp < chrono::Utc::now() - chrono::Duration::days(30) {
-                        // Stop looking back, we've been here before, or it is beyond our vision.
-                        break;
-                    }
-                    if let Some(last_event) = last_processed_in_channel
-                        && message.timestamp <= last_event
-                    {
-                        // We've been here before.
-                        break;
-                    }
-                    for reaction in &message.reactions {
-                        for reactor in message
-                            .reaction_users(ctx, reaction.reaction_type.clone(), None, None)
-                            .await?
-                        {
-                            self.track(reactor.id, Some(id), message.timestamp);
-                        }
-                    }
-                    self.track(message.author.id, Some(id), message.timestamp);
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
 
 type Error = eyre::Error;
 //  Box<dyn std::error::Error + Send + Sync>;
-type Context<'a> = poise::Context<'a, Data, Error>;
+type Context<'a> = poise::Context<'a, data::Data, Error>;
 
 /// Displays your or another user's account creation date
 #[poise::command(slash_command, prefix_command)]
 async fn timing_out(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
 
-    tracing::info!("Running timing_out command");
-    let data = ctx.data().guild_data.lock().await;
-    tracing::info!("Locked data!");
     let Some(guild_id) = ctx.guild_id() else {
         ctx.say("This command can only be used in a guild".to_string())
             .await?;
         return Ok(());
     };
-    let Some(guild_data) = data.get(&guild_id) else {
-        ctx.say("No data for this guild yet".to_string()).await?;
+    let Some(guild_config) = ctx.data().db.get_guild(guild_id).await? else {
+        ctx.say("This guild is not configured yet".to_string())
+            .await?;
         return Ok(());
     };
-    let mut users_last_seen = guild_data.users_last_seen.iter().collect::<Vec<_>>();
-    users_last_seen.sort_by_key(|(_, ts)| *ts);
-
-    tracing::info!("Found {} users", users_last_seen.len());
-
+    let mut all_users = guild_id
+        .to_partial_guild(ctx)
+        .await?
+        .members(ctx, None, None)
+        .await?
+        .into_iter()
+        .map(|member| (member.user.id, member.user.bot))
+        .collect::<HashMap<_, _>>();
+    let mut last_user_activity = ctx.data().db.get_user_activity(guild_id).await?;
+    last_user_activity.sort_by_key(|a| a.last_message_timestamp.max(a.last_reaction_timestamp));
     let mut timeout_msg = String::new();
-    for (user_id, timestamp) in users_last_seen {
-        if chrono::Utc::now() - **timestamp < chrono::Duration::days(30) {
+    for activity in last_user_activity {
+        all_users.remove(&activity.user_id);
+
+        if activity.is_bot {
             continue;
         }
-        let Ok(user) = user_id.to_user(ctx).await else {
-            tracing::warn!("Failed to fetch user {}", user_id);
+        let last_activity = activity
+            .last_message_timestamp
+            .max(activity.last_reaction_timestamp);
+        if let Some(activity_ts) = last_activity
+            && *activity_ts
+                > chrono::Utc::now()
+                    - chrono::Duration::days(guild_config.inactivity_threshold_days)
+        {
+            tracing::info!(
+                "Skipping user {} because they were active within the last {} days ({last_activity:?})",
+                activity.user_id,
+                guild_config.inactivity_threshold_days
+            );
             continue;
-        };
-        if user.bot {
+        }
+        writeln!(timeout_msg, "<@{}> - {:?}", activity.user_id, last_activity)?;
+    }
+
+    for (user_id, is_bot) in all_users {
+        if is_bot {
             continue;
         }
         writeln!(
             timeout_msg,
-            "<@{}> - {} days ago",
-            user_id,
-            (chrono::Utc::now() - **timestamp).num_days()
+            "<@{}> - before {} days",
+            user_id, guild_config.inactivity_threshold_days
         )?;
     }
+
     if timeout_msg.len() > 1000 {
         timeout_msg.truncate(1000);
         timeout_msg.push_str("\n...and more");
@@ -249,20 +85,38 @@ async fn timing_out(ctx: Context<'_>) -> Result<(), Error> {
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
-    data: &Data,
+    data: &data::Data,
 ) -> Result<(), Error> {
     match event {
         serenity::FullEvent::Ready { data_about_bot } => {
+            tracing::info!("Ready! Logged in as {}", data_about_bot.user.name);
+
             for guild in &data_about_bot.guilds {
-                data.db.add_guild(guild.id).await?;
-                data.index(ctx, guild.id).await.context("while indexing")?;
+                tokio::spawn({
+                    let http = ctx.http.clone();
+                    let data = data.clone();
+                    let guild_id = guild.id;
+                    async move {
+                        if let Err(e) = data.db.add_guild(guild_id).await {
+                            tracing::error!("Error adding guild {guild_id}: {e:?}");
+                        }
+                        if let Err(e) = data.index(&http, guild_id).await {
+                            tracing::error!("Error indexing guild {guild_id}: {e:?}");
+                        }
+                    }
+                });
             }
         }
         serenity::FullEvent::Message { new_message } => {
             let Some(guild_id) = new_message.guild_id else {
-                tracing::warn!("Message not in a guild: {:?}", new_message);
+                tracing::warn!("Message not in a guild: {new_message:?}");
                 return Ok(());
             };
+            tracing::info!(
+                "Message in guild {guild_id}: {} ({})",
+                new_message.id,
+                new_message.timestamp
+            );
             data.db
                 .add_channel(new_message.channel_id, None, guild_id)
                 .await?;
@@ -292,6 +146,11 @@ async fn event_handler(
                 tracing::warn!("Reaction has no message_author_id: {:?}", add_reaction);
                 return Ok(());
             };
+            tracing::info!(
+                "Reaction in guild {guild_id}: {} ({})",
+                add_reaction.message_id,
+                add_reaction.channel_id
+            );
             data.db
                 .add_channel(add_reaction.channel_id, None, guild_id)
                 .await?;
@@ -347,17 +206,7 @@ async fn main() -> eyre::Result<()> {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                if let Ok(file) = std::fs::File::open(DATA_FILE) {
-                    Ok(Data {
-                        guild_data: Arc::new(Mutex::new(serde_json::from_reader(file)?)),
-                        db,
-                    })
-                } else {
-                    Ok(Data {
-                        guild_data: Arc::new(Mutex::new(BTreeMap::new())),
-                        db,
-                    })
-                }
+                Ok(data::Data { db })
             })
         })
         .build();

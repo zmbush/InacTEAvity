@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serenity::model::{
     Timestamp,
     id::{ChannelId, GuildId, MessageId, UserId},
@@ -5,7 +7,7 @@ use serenity::model::{
 
 const DB_FILE: &str = "sqlite:data.db";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Db {
     pool: sqlx::SqlitePool,
 }
@@ -18,6 +20,20 @@ pub(crate) struct GuildData {
     pub(crate) report_channel: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+pub(crate) struct User {
+    pub(crate) id: i64,
+    pub(crate) is_bot: bool,
+}
+
+#[derive(Debug, sqlx::FromRow, Default)]
+pub(crate) struct LastUserActivity {
+    pub(crate) user_id: UserId,
+    pub(crate) is_bot: bool,
+    pub(crate) last_message_timestamp: Option<Timestamp>,
+    pub(crate) last_reaction_timestamp: Option<Timestamp>,
+}
+
 impl Db {
     pub(crate) async fn new() -> Result<Self, sqlx::Error> {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -28,13 +44,24 @@ impl Db {
         Ok(Self { pool })
     }
 
+    pub(crate) async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
+        self.pool.begin().await
+    }
+
     pub(crate) async fn add_guild(&self, guild_id: GuildId) -> Result<(), sqlx::Error> {
+        Self::add_guild_with(&self.pool, guild_id).await
+    }
+
+    pub(crate) async fn add_guild_with<'c, E>(e: E, guild_id: GuildId) -> Result<(), sqlx::Error>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
         sqlx::query!(
             "INSERT INTO guilds (id, inactivity_threshold_days) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
             i64::from(guild_id),
             30
         )
-        .execute(&self.pool)
+        .execute(e)
         .await?;
 
         Ok(())
@@ -124,7 +151,12 @@ impl Db {
         timestamp: Timestamp,
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "INSERT INTO reactions (message_id, user_id, created_at) VALUES (?, ?, ?) ON CONFLICT(message_id, user_id) DO UPDATE SET created_at = excluded.created_at",
+            "INSERT INTO reactions
+                (message_id, user_id, created_at)
+            VALUES
+                (?, ?, ?)
+            ON CONFLICT(message_id, user_id) DO 
+            UPDATE SET created_at = excluded.created_at",
             i64::from(message_id),
             i64::from(user_id),
             timestamp.unix_timestamp()
@@ -133,5 +165,85 @@ impl Db {
         .await?;
 
         Ok(())
+    }
+
+    pub(crate) async fn get_user_activity(
+        &self,
+        guild_id: GuildId,
+    ) -> Result<Vec<LastUserActivity>, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+
+        #[derive(sqlx::FromRow)]
+        struct UserMessages {
+            user_id: Option<i64>,
+            last_message_timestamp: Option<chrono::NaiveDateTime>,
+            is_bot: Option<bool>,
+        }
+        let user_messages = sqlx::query_as!(
+            UserMessages,
+            r#"
+            SELECT
+                m.user_id,
+                MAX(COALESCE(m.edited_at, m.created_at)) as last_message_timestamp,
+                u.is_bot as is_bot
+            FROM messages m
+            LEFT JOIN users u ON m.user_id = u.id 
+            WHERE m.channel_id IN (SELECT id FROM channels WHERE guild_id = ?)
+            GROUP BY user_id;"#,
+            i64::from(guild_id)
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        #[derive(sqlx::FromRow)]
+        struct UserReactions {
+            user_id: Option<i64>,
+            last_reaction_timestamp: Option<chrono::NaiveDateTime>,
+            is_bot: Option<bool>,
+        }
+        let user_reactions = sqlx::query_as!(
+            UserReactions,
+            "SELECT
+                r.user_id,
+                MAX(created_at) as last_reaction_timestamp,
+                u.is_bot as is_bot
+            FROM reactions r
+            LEFT JOIN users u ON r.user_id = u.id 
+            WHERE r.message_id IN (SELECT id FROM messages WHERE channel_id IN (SELECT id FROM channels WHERE guild_id = ?)) GROUP BY user_id",
+            i64::from(guild_id)
+            )
+            .fetch_all(&mut *transaction)
+            .await?;
+
+        let mut users = HashMap::<_, LastUserActivity>::new();
+        for msg in user_messages {
+            let Some(id) = msg.user_id else { continue };
+            let Some(is_bot) = msg.is_bot else { continue };
+
+            let entry = users.entry(id).or_default();
+            entry.user_id = UserId::from(id as u64);
+            entry.last_message_timestamp = msg
+                .last_message_timestamp
+                .map(|t| Timestamp::from_unix_timestamp(t.and_utc().timestamp()).unwrap());
+            entry.is_bot = is_bot;
+        }
+
+        for reaction in user_reactions {
+            let Some(id) = reaction.user_id else {
+                continue;
+            };
+            let Some(is_bot) = reaction.is_bot else {
+                continue;
+            };
+
+            let entry = users.entry(id).or_default();
+            entry.user_id = UserId::from(id as u64);
+            entry.last_reaction_timestamp = reaction
+                .last_reaction_timestamp
+                .map(|t| Timestamp::from_unix_timestamp(t.and_utc().timestamp()).unwrap());
+            entry.is_bot = is_bot;
+        }
+
+        Ok(users.into_values().collect())
     }
 }
