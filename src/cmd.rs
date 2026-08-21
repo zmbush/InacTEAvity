@@ -101,8 +101,10 @@ pub(crate) async fn config(
         .get_guild(guild_id)
         .await?
         .ok_or_eyre("Guild not in DB")?;
+    let mut reindex = false;
     if let Some(inactivity_window_days) = inactivity_window_days {
         guild_data.inactivity_threshold_days = inactivity_window_days;
+        reindex = true;
     }
     if let Some(channel) = notification_channel {
         guild_data.report_channel = Some(i64::from(channel.id()));
@@ -114,6 +116,17 @@ pub(crate) async fn config(
         guild_data.warning_threshold_days = warning_threshold_days;
     }
     ctx.data().db.update_guild(guild_data).await?;
+    if reindex {
+        tokio::spawn({
+            let http = ctx.serenity_context().http.clone();
+            let data = ctx.data().clone();
+            async move {
+                if let Err(e) = data.index(&http, guild_id).await {
+                    tracing::error!("Error indexing guild {guild_id}: {e:?}");
+                }
+            }
+        });
+    }
     ctx.say("Done.").await?;
     Ok(())
 }

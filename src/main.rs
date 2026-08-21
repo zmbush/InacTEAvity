@@ -6,15 +6,13 @@ mod cmd;
 mod data;
 mod db;
 
-type Error = eyre::Error;
-//  Box<dyn std::error::Error + Send + Sync>;
-type Context<'a> = poise::Context<'a, data::Data, Error>;
+type Context<'a> = poise::Context<'a, data::Data, eyre::Error>;
 
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
     data: &data::Data,
-) -> Result<(), Error> {
+) -> eyre::Result<()> {
     match event {
         serenity::FullEvent::Ready { data_about_bot } => {
             tracing::info!("Ready! Logged in as {}", data_about_bot.user.name);

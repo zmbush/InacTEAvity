@@ -1,11 +1,8 @@
-use ::serenity::builder::GetMessages;
 use eyre::{Context as _, OptionExt as _};
 use futures::StreamExt as _;
 use poise::serenity_prelude::{self as serenity};
 
 use crate::db;
-
-use super::Error;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Data {
@@ -13,7 +10,7 @@ pub(crate) struct Data {
 }
 
 impl Data {
-    pub(crate) async fn index<Ctx>(&self, ctx: Ctx, guild: serenity::GuildId) -> Result<(), Error>
+    pub(crate) async fn index<Ctx>(&self, ctx: Ctx, guild: serenity::GuildId) -> eyre::Result<()>
     where
         Ctx: AsRef<serenity::Http> + serenity::CacheHttp + Copy,
     {
@@ -41,7 +38,12 @@ impl Data {
                     .await
                     .context("while adding channel")?;
 
-                tracing::info!(" - Indexing channel {} ({})", channel.name, id);
+                tracing::info!(
+                    " - [{}] Indexing channel {} ({})",
+                    guild.name,
+                    channel.name,
+                    id
+                );
                 let oldest_in_channel = self.db.oldest_message_in_channel(id).await?;
                 if let Some(oldest_in_channel) = oldest_in_channel {
                     if oldest_in_channel.created_at.and_utc() < lookback {
@@ -50,7 +52,7 @@ impl Data {
                     } else {
                         let mut oldest_id = serenity::MessageId::from(oldest_in_channel.id as u64);
                         // Index before this message, the loop below will get the most recent messages.
-                        loop {
+                        'searchback: loop {
                             let batch = id
                                 .messages(
                                     ctx,
@@ -61,7 +63,21 @@ impl Data {
                             if batch.is_empty() {
                                 break;
                             }
-                            for message in batch {}
+                            oldest_id = batch.last().unwrap().id;
+                            for message in batch {
+                                let keep_going = self
+                                    .index_message(
+                                        ctx,
+                                        &guild.name,
+                                        &channel.name,
+                                        message,
+                                        lookback,
+                                    )
+                                    .await?;
+                                if !keep_going {
+                                    break 'searchback;
+                                }
+                            }
                         }
                     }
                 }
@@ -72,48 +88,75 @@ impl Data {
                         tracing::warn!("Error fetching message: {:?}", message);
                         break;
                     };
-                    if *message.timestamp < lookback {
-                        // Stop looking back, we've been here before, or it is beyond our vision.
+                    let keep_going = self
+                        .index_message(ctx, &guild.name, &channel.name, message, lookback)
+                        .await?;
+                    if !keep_going {
                         break;
-                    }
-                    if self.db.seen_message(message.id).await? {
-                        // We've seen this message before.
-                        break;
-                    }
-                    tracing::info!("Message: {} ({})", message.id, message.timestamp);
-                    self.db
-                        .add_user(
-                            message.author.id,
-                            message.author.bot,
-                            Some(&message.author.name),
-                        )
-                        .await
-                        .context("while adding user")?;
-                    self.db
-                        .add_message(
-                            message.id,
-                            message.channel_id,
-                            Some(message.author.id),
-                            message.timestamp,
-                            message.edited_timestamp,
-                        )
-                        .await
-                        .context("while adding message")?;
-                    for reaction in &message.reactions {
-                        for reactor in message
-                            .reaction_users(ctx, reaction.reaction_type.clone(), None, None)
-                            .await?
-                        {
-                            self.db
-                                .add_reaction(message.id, reactor.id, message.timestamp)
-                                .await
-                                .context("while adding reaction")?;
-                        }
                     }
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn index_message<Ctx>(
+        &self,
+        ctx: Ctx,
+        guild_name: &str,
+        channel_name: &str,
+        message: serenity::Message,
+        lookback: chrono::DateTime<chrono::Utc>,
+    ) -> eyre::Result<bool>
+    where
+        Ctx: AsRef<serenity::Http> + serenity::CacheHttp + Copy,
+    {
+        if *message.timestamp < lookback {
+            // Stop looking back, we've been here before, or it is beyond our vision.
+            return Ok(false);
+        }
+        if self.db.seen_message(message.id).await? {
+            // We've seen this message before.
+            return Ok(false);
+        }
+        tracing::info!(
+            "  % [{}][{}] Message: {} ({})",
+            guild_name,
+            channel_name,
+            message.id,
+            message.timestamp
+        );
+        self.db
+            .add_user(
+                message.author.id,
+                message.author.bot,
+                Some(&message.author.name),
+            )
+            .await
+            .context("while adding user")?;
+        self.db
+            .add_message(
+                message.id,
+                message.channel_id,
+                Some(message.author.id),
+                message.timestamp,
+                message.edited_timestamp,
+            )
+            .await
+            .context("while adding message")?;
+        for reaction in &message.reactions {
+            for reactor in message
+                .reaction_users(ctx, reaction.reaction_type.clone(), None, None)
+                .await?
+            {
+                self.db
+                    .add_reaction(message.id, reactor.id, message.timestamp)
+                    .await
+                    .context("while adding reaction")?;
+            }
+        }
+
+        Ok(true)
     }
 }
