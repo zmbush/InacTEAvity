@@ -30,6 +30,15 @@ pub(crate) struct LastUserActivity {
     pub(crate) last_reaction_timestamp: Option<Timestamp>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct Message {
+    pub(crate) id: i64,
+    pub(crate) channel_id: i64,
+    pub(crate) user_id: Option<i64>,
+    pub(crate) created_at: chrono::NaiveDateTime,
+    pub(crate) edited_at: Option<chrono::NaiveDateTime>,
+}
+
 impl Db {
     pub(crate) async fn new() -> Result<Self, sqlx::Error> {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -176,6 +185,19 @@ impl Db {
         .await?;
 
         Ok(())
+    }
+
+    pub(crate) async fn oldest_message_in_channel(
+        &self,
+        channel_id: ChannelId,
+    ) -> Result<Option<Message>, sqlx::Error> {
+        sqlx::query_as!(
+            Message,
+            "SELECT * FROM messages WHERE channel_id = ? ORDER BY created_at ASC LIMIT 1",
+            i64::from(channel_id)
+        )
+        .fetch_optional(&self.pool)
+        .await
     }
 
     pub(crate) async fn get_user_activity(

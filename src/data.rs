@@ -1,3 +1,4 @@
+use ::serenity::builder::GetMessages;
 use eyre::{Context as _, OptionExt as _};
 use futures::StreamExt as _;
 use poise::serenity_prelude::{self as serenity};
@@ -41,9 +42,31 @@ impl Data {
                     .context("while adding channel")?;
 
                 tracing::info!(" - Indexing channel {} ({})", channel.name, id);
-                let mut messages =
-                    serenity::MessagesIter::<serenity::Http>::stream(ctx, id).boxed();
+                let oldest_in_channel = self.db.oldest_message_in_channel(id).await?;
+                if let Some(oldest_in_channel) = oldest_in_channel {
+                    if oldest_in_channel.created_at.and_utc() < lookback {
+                        // We've already indexed this channel back to the lookback point, so we can skip it.
+                        continue;
+                    } else {
+                        let mut oldest_id = serenity::MessageId::from(oldest_in_channel.id as u64);
+                        // Index before this message, the loop below will get the most recent messages.
+                        loop {
+                            let batch = id
+                                .messages(
+                                    ctx,
+                                    serenity::builder::GetMessages::default().before(oldest_id),
+                                )
+                                .await?;
 
+                            if batch.is_empty() {
+                                break;
+                            }
+                            for message in batch {}
+                        }
+                    }
+                }
+
+                let mut messages = id.messages_iter(ctx).boxed();
                 while let Some(message) = messages.next().await {
                     let Ok(message) = message else {
                         tracing::warn!("Error fetching message: {:?}", message);
